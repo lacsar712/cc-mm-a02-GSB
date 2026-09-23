@@ -12,11 +12,19 @@
     #live { min-height: 1.4em; }
     table { width: 100%; border-collapse: collapse; }
     td, th { border-bottom: 1px solid #57534e; padding: 6px; text-align: left; }
+    nav button { font-weight: bold; }
+    .panel-title { margin-top: 24px; }
+    .shift-actions button { padding: 4px 8px; }
+    #shiftMsg { min-height: 1.4em; color: #fcd34d; }
   </style>
 </head>
 <body>
   <header>
     <strong>矿井瓦斯班测台</strong>
+    <nav>
+      <button id="nav-readings">班测上报</button>
+      <button id="nav-shifts">班次窗</button>
+    </nav>
     <span id="who"></span>
     <button id="out" hidden>退出</button>
   </header>
@@ -28,7 +36,8 @@
       <button id="go">登录</button>
       <p>gasman / gas123456 可上报；viewer / view123456 只能看</p>
     </section>
-    <section id="app" hidden>
+
+    <section id="view-readings" hidden>
       <p id="live">等待推送</p>
       <form id="form">
         <input id="site" placeholder="测点" />
@@ -36,6 +45,27 @@
         <button>上报</button>
       </form>
       <table><thead><tr><th>测点</th><th>甲烷 %</th><th>状态</th><th>说明</th></tr></thead><tbody id="rows"></tbody></table>
+    </section>
+
+    <section id="view-shifts" hidden>
+      <h2 class="panel-title">班次窗</h2>
+      <p id="shiftMsg"></p>
+      <form id="openShiftForm">
+        <input id="shiftName" placeholder="班次名，如 夜班" />
+        <input id="shiftStart" type="datetime-local" step="1" title="起刻" />
+        <input id="shiftEnd" type="datetime-local" step="1" title="止刻" />
+        <button>开启班次</button>
+      </form>
+      <h3>班次列表</h3>
+      <table>
+        <thead><tr><th>名称</th><th>起刻</th><th>止刻</th><th>开启人</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody id="shiftRows"></tbody>
+      </table>
+      <h3>大事记</h3>
+      <table>
+        <thead><tr><th>时刻</th><th>班次</th><th>事项</th><th>操作人</th><th>详情</th></tr></thead>
+        <tbody id="eventRows"></tbody>
+      </table>
     </section>
   </main>
   <script src="/app.js"></script>

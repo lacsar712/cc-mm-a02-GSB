@@ -6,7 +6,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-from sqlalchemy import DateTime, Float, String, create_engine
+from sqlalchemy import DateTime, Float, ForeignKey, String, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from app.rules import classify
@@ -44,6 +44,30 @@ class Reading(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class Shift(Base):
+    __tablename__ = "shifts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(80))
+    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    opened_by: Mapped[str] = mapped_column(String(64))
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(20), default="开启中")
+    closed_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ShiftEvent(Base):
+    __tablename__ = "shift_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    shift_id: Mapped[int | None] = mapped_column(ForeignKey("shifts.id"), nullable=True)
+    shift_name: Mapped[str] = mapped_column(String(80))
+    kind: Mapped[str] = mapped_column(String(20))
+    actor: Mapped[str] = mapped_column(String(64))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    detail: Mapped[str] = mapped_column(String(200), default="")
+
+
 class LoginIn(BaseModel):
     username: str
     password: str
@@ -52,6 +76,31 @@ class LoginIn(BaseModel):
 class ReadingIn(BaseModel):
     site: str = Field(min_length=1, max_length=80)
     ch4_pct: float
+
+
+class ShiftOpenIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    start_at: datetime
+    end_at: datetime
+
+    def normalized(self) -> "ShiftOpenIn":
+        if self.start_at.tzinfo is None:
+            self.start_at = self.start_at.replace(tzinfo=timezone.utc)
+        if self.end_at.tzinfo is None:
+            self.end_at = self.end_at.replace(tzinfo=timezone.utc)
+        return self
+
+
+class ShiftWindowIn(BaseModel):
+    start_at: datetime
+    end_at: datetime
+
+    def normalized(self) -> "ShiftWindowIn":
+        if self.start_at.tzinfo is None:
+            self.start_at = self.start_at.replace(tzinfo=timezone.utc)
+        if self.end_at.tzinfo is None:
+            self.end_at = self.end_at.replace(tzinfo=timezone.utc)
+        return self
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
@@ -69,8 +118,33 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(secu
 
 def require_writer(user: dict = Depends(current_user)) -> dict:
     if user["role"] != "writer":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅瓦斯检查员可上报")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅瓦斯检查员可操作")
     return user
+
+
+def shift_dict(s: Shift) -> dict:
+    return {
+        "id": s.id,
+        "name": s.name,
+        "start_at": s.start_at.isoformat(),
+        "end_at": s.end_at.isoformat(),
+        "opened_by": s.opened_by,
+        "opened_at": s.opened_at.isoformat(),
+        "status": s.status,
+        "closed_by": s.closed_by,
+        "closed_at": s.closed_at.isoformat() if s.closed_at else None,
+    }
+
+
+def event_dict(e: ShiftEvent) -> dict:
+    return {
+        "id": e.id,
+        "shift_name": e.shift_name,
+        "kind": e.kind,
+        "actor": e.actor,
+        "occurred_at": e.occurred_at.isoformat(),
+        "detail": e.detail,
+    }
 
 
 sockets: set[WebSocket] = set()
@@ -142,16 +216,25 @@ def list_readings(_user: dict = Depends(current_user)):
 
 @app.post("/api/readings", status_code=201)
 async def create_reading(body: ReadingIn, user: dict = Depends(require_writer)):
-    level, note = classify(body.ch4_pct)
+    now = datetime.now(timezone.utc)
     db = SessionLocal()
     try:
+        shift = db.query(Shift).filter(Shift.status == "开启中").one_or_none()
+        if shift is None:
+            raise HTTPException(status_code=409, detail="当前没有开启中的班次，上报被拒绝（已关闭）")
+        if not (shift.start_at <= now <= shift.end_at):
+            raise HTTPException(
+                status_code=409,
+                detail=f"当前时刻不在班次「{shift.name}」起止窗内，上报被拒绝（窗外）",
+            )
+        level, note = classify(body.ch4_pct)
         row = Reading(
             site=body.site.strip(),
             ch4_pct=body.ch4_pct,
             level=level,
             note=note,
             created_by=user["username"],
-            created_at=datetime.now(timezone.utc),
+            created_at=now,
         )
         db.add(row)
         db.commit()
@@ -168,6 +251,132 @@ async def create_reading(body: ReadingIn, user: dict = Depends(require_writer)):
     for ws in dead:
         sockets.discard(ws)
     return payload
+
+
+@app.get("/api/shifts")
+def list_shifts(_user: dict = Depends(current_user)):
+    db = SessionLocal()
+    try:
+        rows = db.query(Shift).order_by(Shift.id.desc()).all()
+        return [shift_dict(s) for s in rows]
+    finally:
+        db.close()
+
+
+@app.get("/api/shift-events")
+def list_shift_events(_user: dict = Depends(current_user)):
+    db = SessionLocal()
+    try:
+        rows = db.query(ShiftEvent).order_by(ShiftEvent.id.desc()).limit(100).all()
+        return [event_dict(e) for e in rows]
+    finally:
+        db.close()
+
+
+@app.post("/api/shifts", status_code=201)
+def open_shift(body: ShiftOpenIn, user: dict = Depends(require_writer)):
+    body.normalized()
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="班次名不能为空")
+    if body.end_at <= body.start_at:
+        raise HTTPException(status_code=422, detail="止刻必须晚于起刻")
+    db = SessionLocal()
+    try:
+        active = db.query(Shift).filter(Shift.status == "开启中").one_or_none()
+        if active is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"已有开启中的班次「{active.name}」，请先关闭再开新班",
+            )
+        now = datetime.now(timezone.utc)
+        shift = Shift(
+            name=name,
+            start_at=body.start_at,
+            end_at=body.end_at,
+            opened_by=user["username"],
+            opened_at=now,
+            status="开启中",
+        )
+        db.add(shift)
+        db.flush()
+        db.add(
+            ShiftEvent(
+                shift_id=shift.id,
+                shift_name=shift.name,
+                kind="开启",
+                actor=user["username"],
+                occurred_at=now,
+                detail=f"起 {body.start_at.isoformat()} / 止 {body.end_at.isoformat()}",
+            )
+        )
+        db.commit()
+        db.refresh(shift)
+        return shift_dict(shift)
+    finally:
+        db.close()
+
+
+@app.patch("/api/shifts/{shift_id}/window")
+def update_shift_window(shift_id: int, body: ShiftWindowIn, user: dict = Depends(require_writer)):
+    body.normalized()
+    if body.end_at <= body.start_at:
+        raise HTTPException(status_code=422, detail="止刻必须晚于起刻")
+    db = SessionLocal()
+    try:
+        shift = db.get(Shift, shift_id)
+        if shift is None:
+            raise HTTPException(status_code=404, detail="班次不存在")
+        if shift.status != "开启中":
+            raise HTTPException(status_code=409, detail="班次已关闭，不能再改起止时刻")
+        old = f"起 {shift.start_at.isoformat()} / 止 {shift.end_at.isoformat()}"
+        shift.start_at = body.start_at
+        shift.end_at = body.end_at
+        db.add(
+            ShiftEvent(
+                shift_id=shift.id,
+                shift_name=shift.name,
+                kind="改窗",
+                actor=user["username"],
+                occurred_at=datetime.now(timezone.utc),
+                detail=f"{old} → 起 {body.start_at.isoformat()} / 止 {body.end_at.isoformat()}",
+            )
+        )
+        db.commit()
+        db.refresh(shift)
+        return shift_dict(shift)
+    finally:
+        db.close()
+
+
+@app.post("/api/shifts/{shift_id}/close")
+def close_shift(shift_id: int, user: dict = Depends(require_writer)):
+    db = SessionLocal()
+    try:
+        shift = db.get(Shift, shift_id)
+        if shift is None:
+            raise HTTPException(status_code=404, detail="班次不存在")
+        if shift.status != "开启中":
+            raise HTTPException(status_code=409, detail="班次已关闭，无需重复关闭")
+        now = datetime.now(timezone.utc)
+        shift.status = "已关闭"
+        shift.closed_by = user["username"]
+        shift.closed_at = now
+        db.add(
+            ShiftEvent(
+                shift_id=shift.id,
+                shift_name=shift.name,
+                kind="关闭",
+                actor=user["username"],
+                occurred_at=now,
+                detail="",
+            )
+        )
+        db.commit()
+        db.refresh(shift)
+        return shift_dict(shift)
+    finally:
+        db.close()
 
 
 @app.websocket("/ws/alerts")
